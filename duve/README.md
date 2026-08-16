@@ -47,25 +47,32 @@ property already exists.
   run — no retries, no endpoint fallbacks.
 - The token is read from the environment only.
 
-## Portal state observed before the run
+## Run record — 2026-08-16, APPLIED
 
-Read live from the portal on 2026-08-16:
+Property group used: **`contact_activity`** (existing; no group was created).
 
-| Property | State |
-|---|---|
-| `conference_name` | exists, label "Conference Name", 52 options |
-| `webinar_name` | exists, label "Webinar Name", 9 options |
-| `lead_capture_route` | 18 options — matches the spec's expectation |
-| `lead_capture_route__first_touch` | 21 options — matches the spec's expectation |
-| `engagement_type` | does not exist |
-| `conference_touchpoints` | does not exist |
-| `webinar_touchpoints` | does not exist |
-| `event_staging` | does not exist |
-| `webinar_staging` | does not exist |
+| Property | Before | Action | After |
+|---|---|---|---|
+| `conference_name` | label "Conference Name", 51 options | PATCHED (label + description) | label "Conference — Source", **51 options, name unchanged** |
+| `webinar_name` | label "Webinar Name", 9 options | PATCHED (label + description) | label "Webinar — Source", **9 options, name unchanged** |
+| `engagement_type` | did not exist | CREATED | enumeration/select, 8 options |
+| `conference_touchpoints` | did not exist | CREATED | enumeration/checkbox, 38 options (= CSV rows) |
+| `webinar_touchpoints` | did not exist | CREATED | enumeration/checkbox, 8 options |
+| `event_staging` | did not exist | CREATED | string/text |
+| `webinar_staging` | did not exist | CREATED | string/text |
+| `lead_capture_route` | 18 options | PATCHED (merged array) | **21 options, all 18 originals present** |
 
-The three values Task 5 adds (`Partner`, `Employee Referral`,
-`Customer Referral`) are exactly the three present on first touch and absent
-from last touch, so the merge brings the two sets into alignment at 21.
+All 8 end-of-run verification GETs returned PASS. The result was then
+independently re-read through a separate credential to confirm; the original
+option *labels* on `lead_capture_route` survived the array replace intact
+(`HTR` → "Hotel Tech Report", `Outbound SDR` → "Outbound SDR (external)",
+`Integrations` → "Integrations form").
+
+`lead_capture_route` and `lead_capture_route__first_touch` now both carry 21
+options and are aligned.
+
+Re-running the script is a no-op: the creates report SKIPPED, and Task 5
+detects the three values are already present and skips the merge.
 
 ## Known discrepancy — webinar 06/2025 vs 07/2025
 
