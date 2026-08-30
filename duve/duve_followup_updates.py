@@ -41,8 +41,13 @@ CONFERENCE_NAME_ADDITIONS = [
 ]
 
 # B. webinar date correction
-WEBINAR_OLD = "Operational Excellence: Streamlining Guest Experience - 06/2025"
-WEBINAR_NEW = "Operational Excellence: Streamlining Guest Experience - 07/2025"
+# The webinar ran in July (client-confirmed). webinar_name stores it under a
+# 06/2025 VALUE with an 07/2025 LABEL, and its value cannot change without
+# orphaning records. webinar_touchpoints therefore mirrors that exactly:
+# the value matches webinar_name so WF-2 can write both fields from one
+# staged string, while the label shows the true July date.
+WEBINAR_VALUE = "Operational Excellence: Streamlining Guest Experience - 06/2025"
+WEBINAR_LABEL = "Operational Excellence: Streamlining Guest Experience - 07/2025"
 
 # C. events Marina categorised as Conference; values match conference_name
 CONFERENCE_TOUCHPOINT_ADDITIONS = [
