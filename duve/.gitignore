@@ -1,0 +1,4 @@
+# Review workbook contains client contact emails - rebuild from
+# build_review_workbook.py rather than committing customer data.
+duve_pending_changes_review.xlsx
+__pycache__/
