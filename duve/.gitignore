@@ -1,0 +1,5 @@
+# Generated review workbook. Rebuild with build_review_workbook.py.
+# Not committed: it contains client contact records (2,500+ email addresses)
+# pulled live from the portal, and is regenerable at any time.
+duve_pending_changes_review.xlsx
+__pycache__/
