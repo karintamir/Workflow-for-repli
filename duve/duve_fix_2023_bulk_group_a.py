@@ -34,11 +34,9 @@ SRC = "conference_name"
 EXPECT_CURRENT = "equiphotel_paris_2022"
 CORRECT_TO = "fht_paris_2023"
 
-GROUP_A = [
-    "philippe@hiphophostels.com",
-    "alj@homequalityclub.com",
-    "ngerschel@gmail.com",
-]
+# HubSpot contact IDs rather than email addresses — this repo is public, so
+# client contact details do not belong in it.
+GROUP_A = ["414998", "6511652", "6509851"]
 
 
 class Halt(Exception):
@@ -78,20 +76,13 @@ def main():
         raise Halt("%r is not an option on %s" % (CORRECT_TO, SRC))
 
     plan = []
-    for email in GROUP_A:
-        s, b = api("POST", "/crm/v3/objects/contacts/search", token,
-                   {"filterGroups": [{"filters": [
-                       {"propertyName": "email", "operator": "EQ",
-                        "value": email}]}],
-                    "properties": ["email"], "limit": 1})
-        if s != 200 or not b.get("results"):
-            print("  %-38s NOT FOUND — skipping" % email)
-            continue
-        cid = b["results"][0]["id"]
-
+    for cid in GROUP_A:
         s, b = api("POST", "/crm/v3/objects/contacts/batch/read", token,
                    {"propertiesWithHistory": [SRC], "properties": [SRC],
                     "inputs": [{"id": cid}]})
+        if s not in (200, 207) or not b.get("results"):
+            print("  %-12s NOT FOUND — skipping" % cid)
+            continue
         rec = b["results"][0]
         cur = (rec.get("properties") or {}).get(SRC)
         hist = sorted((rec.get("propertiesWithHistory") or {}).get(SRC) or [],
@@ -104,13 +95,13 @@ def main():
               and latest.get("sourceType") == "CRM_UI_BULK_ACTION"
               and latest["timestamp"][:4] == "2023"
               and any(x["value"] == CORRECT_TO for x in hist))
-        print("  %-38s current=%-24s %s"
-              % (email, cur, "OK" if ok else "SKIP — no longer matches review"))
+        print("  %-12s current=%-24s %s"
+              % (cid, cur, "OK" if ok else "SKIP — no longer matches review"))
         for x in hist:
             print("        %s  %-26s %s"
                   % (x["timestamp"][:10], x["value"], x.get("sourceType")))
         if ok:
-            plan.append((cid, email))
+            plan.append(cid)
 
     if not plan:
         print("\nNothing to change.")
@@ -122,20 +113,20 @@ def main():
 
     s, b = api("POST", "/crm/v3/objects/contacts/batch/update", token,
                {"inputs": [{"id": cid, "properties": {SRC: CORRECT_TO}}
-                           for cid, _ in plan]})
+                           for cid in plan]})
     if s not in (200, 207):
         raise Halt("batch update -> %s: %s" % (s, json.dumps(b)[:400]))
 
     print("\nverifying ...")
     s, b = api("POST", "/crm/v3/objects/contacts/batch/read", token,
-               {"properties": [SRC], "inputs": [{"id": c} for c, _ in plan]})
+               {"properties": [SRC], "inputs": [{"id": c} for c in plan]})
     bad = []
     for rec in b.get("results", []):
         v = (rec.get("properties") or {}).get(SRC)
         if v != CORRECT_TO:
             bad.append((rec["id"], v))
-    for cid, email in plan:
-        print("  %-38s -> %s" % (email, CORRECT_TO))
+    for cid in plan:
+        print("  %-12s -> %s" % (cid, CORRECT_TO))
     if bad:
         raise Halt("did not take on: %s" % bad)
     print("\n%d contact(s) corrected and verified." % len(plan))

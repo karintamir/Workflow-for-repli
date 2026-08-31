@@ -16,8 +16,8 @@ Per contact:
 Note the difference from the conference backfill, which used record order.
 webinar_name is declared single-select but an automation uses it as an
 ACCUMULATOR: each history entry rewrites the whole semicolon-joined list, and
-the order inside that list is not chronological. tmcvacationrentals@gmail.com
-is typical — the value is "Maximizing Revenue - Jan 2026" at 17:38:16 and
+the order inside that list is not chronological. On one typical contact the
+value is "Maximizing Revenue - Jan 2026" at 17:38:16 and becomes
 "IT Webinar - 11/2025;Maximizing Revenue - Jan 2026" three seconds later,
 because the automation back-filled the older registration. Record order would
 name Jan 2026 as their first webinar when in fact it was Nov 2025; this
