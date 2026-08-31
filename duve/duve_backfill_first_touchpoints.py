@@ -14,9 +14,11 @@ Per contact:
     Conference — Touchpoints = EVERY distinct value in history
 
 Complications handled:
-  * CRM_UI_BULK_ACTION entries are the option merges done in the UI
-    (FHT_2026 -> "FHT Paris 2026"). They rename the same event and must not
-    be read as a second conference.
+  * Recent UI option merges (FHT_2026 -> "FHT Paris 2026") appear in history
+    as value changes. They rename the same event, so they are collapsed by
+    mapping values forward and de-duplicating — NOT by filtering on source
+    type, which would also discard genuine 2023 bulk edits that are the only
+    record of a real conference for 21 contacts.
   * Historical values that were merged away no longer exist as options, so
     they are mapped forward to their surviving equivalent.
   * A few records hold semicolon-joined values in this single-select field;
@@ -163,11 +165,12 @@ def main():
             cid = r["id"]
             props = r.get("properties") or {}
             hist = (r.get("propertiesWithHistory") or {}).get(SRC) or []
-            real = [h for h in hist if h.get("sourceType") != "CRM_UI_BULK_ACTION"]
-            if not real:
-                real = hist
-            # oldest first
-            real = sorted(real, key=lambda h: h["timestamp"])
+            # Do NOT filter by sourceType. Bulk actions are not only the recent
+            # option merges — there are genuine 2023 bulk edits, and 21 contacts
+            # hold a real conference recorded ONLY in one of those. The merge
+            # renames collapse on their own once values are mapped forward,
+            # so normalisation handles them without discarding history.
+            real = sorted(hist, key=lambda h: h["timestamp"])
             seq = []
             for h in real:
                 for v in normalise(h.get("value")):
