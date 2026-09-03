@@ -10,6 +10,17 @@ directly, and emits a structured JSON + human-readable report that feeds
 audit Areas 1 (sender auth), 5 (Workflows & Automation), and 7 (Marketing
 Hub email health).
 
+Area 5 uses GET /automation/v4/flows (public BETA) plus a batch detail read.
+It previously used GET /automation/v3/workflows, which is legacy and returns
+only older contact-based workflows: on one portal it reported 5 workflows
+where 20 existed, and the audit wrongly concluded that automation did not
+govern the CRM. The pull now carries a sanity guard that marks Area 5
+unavailable rather than scoring a truncated result.
+
+Note: no HubSpot API exposes a workflow's LAST-RUN time. `updatedAt` is the
+last edit. Do not present it as evidence that a workflow has or has not
+fired — confirm activity in the HubSpot UI.
+
 Auth: a HubSpot Private App access token with (at minimum) these scopes:
     automation                     -> workflows
     content                        -> forms, domains
@@ -104,6 +115,30 @@ class HubSpotClient:
             return body, r.status_code, None
         return None, -1, "retries exhausted"
 
+    def post(self, path, body):
+        if self.proxy_base:
+            url = f"{self.proxy_base}/hubspot/{path.lstrip('/')}"
+        else:
+            url = f"{API_BASE}/{path.lstrip('/')}"
+        headers = {"Authorization": self.auth_header, "Content-Type": "application/json"}
+        for attempt in range(4):
+            try:
+                r = self.session.post(url, headers=headers, json=body, timeout=30)
+            except requests.RequestException as e:
+                if attempt == 3:
+                    return None, -1, str(e)
+                time.sleep(2 ** attempt)
+                continue
+            if r.status_code == 429:
+                time.sleep(2 ** attempt)
+                continue
+            try:
+                payload = r.json()
+            except ValueError:
+                payload = r.text
+            return payload, r.status_code, None
+        return None, -1, "retries exhausted"
+
     def paginate(self, path, params=None, results_key="results", limit=100):
         """Follow HubSpot v3 paging (paging.next.after) and collect results."""
         params = dict(params or {})
@@ -126,97 +161,182 @@ class HubSpotClient:
 # ---------------------------------------------------------------------------
 # Area 5 — Workflows & Automation
 # ---------------------------------------------------------------------------
+SET_PROPERTY_ACTION = "0-5"          # actionTypeId for "set property"
+HYGIENE_PROPS = {
+    "lifecyclestage": "Sets Lifecycle Stage",
+    "hs_lead_status": "Sets Lead Status",
+    "hubspot_owner_id": "Assigns Owner",
+}
+OBJECT_LABELS = {"0-1": "Contact", "0-2": "Company", "0-3": "Deal", "0-5": "Ticket"}
+
+
+class WorkflowPullError(RuntimeError):
+    pass
+
+
+def _list_flows(client):
+    """GET /automation/v4/flows — every workflow, key fields only."""
+    out, after = [], None
+    while True:
+        params = {"limit": 100}
+        if after:
+            params["after"] = after
+        body, status, err = client.get("automation/v4/flows", params)
+        if status != 200 or not isinstance(body, dict):
+            return out, status, err or f"HTTP {status}"
+        out.extend(body.get("results", []))
+        after = (body.get("paging", {}) or {}).get("next", {}).get("after")
+        if not after:
+            return out, 200, None
+
+
+def _flow_details(client, flow_ids, chunk=50):
+    """POST /automation/v4/flows/batch/read — full spec per workflow.
+
+    Partial failures come back inside the payload, not as an HTTP error, so
+    they are collected rather than raised. Flows holding sensitive-data
+    properties can fail individually without additional scopes.
+    """
+    details, failed = [], []
+    for i in range(0, len(flow_ids), chunk):
+        batch = flow_ids[i:i + chunk]
+        body = {"inputs": [{"flowId": str(f), "type": "FLOW_ID"} for f in batch]}
+        payload, status, err = client.post("automation/v4/flows/batch/read", body)
+        if status != 200 or not isinstance(payload, dict):
+            failed.append({"batch_start": i, "error": err or f"HTTP {status}"})
+            continue
+        details.extend(payload.get("results", []))
+        for e in payload.get("errors", []) or []:
+            failed.append(e)
+    return details, failed
+
+
+def _sanity_problems(stub_count, detail_count, flows, failed):
+    """Reasons this pull must NOT be scored.
+
+    An audit that under-reports automation does not produce a cautious
+    finding — it produces a confident, wrong one.
+    """
+    problems = []
+    if stub_count != detail_count:
+        problems.append(
+            f"Detail fetch incomplete: {detail_count} of {stub_count} workflows "
+            f"returned full specs ({len(failed)} batch errors)."
+        )
+    if stub_count < 1:
+        problems.append("No workflows returned at all.")
+    # A real portal mixes object types and trigger styles. Uniformity across
+    # many flows means a filtered endpoint, not a uniform portal.
+    if len(flows) > 3:
+        obj_types = {f.get("objectTypeId") for f in flows}
+        if len(obj_types) == 1:
+            problems.append(
+                f"All {len(flows)} workflows share objectTypeId "
+                f"{obj_types.pop()} — that is the legacy v3 signature."
+            )
+        types = {f.get("type") for f in flows}
+        if len(types) == 1:
+            problems.append(
+                f"All {len(flows)} workflows are type {types.pop()} — "
+                "suspiciously uniform."
+            )
+    return problems
+
+
 def audit_workflows(client):
-    section = {"available": False, "source": "automation/v3/workflows"}
-    body, status, err = client.get("automation/v3/workflows")
-    if status != 200 or not isinstance(body, dict):
+    section = {"available": False, "source": "automation/v4/flows"}
+
+    stubs, status, err = _list_flows(client)
+    if status != 200:
         section["error"] = f"HTTP {status}: {err or 'unauthorized — check the automation scope'}"
         return section
 
-    workflows = body.get("workflows", [])
+    details, failed = _flow_details(client, [s["id"] for s in stubs])
+    enabled_by_id = {str(s["id"]): s.get("isEnabled") for s in stubs}
+    for d in details:
+        d["_isEnabled"] = enabled_by_id.get(str(d.get("id")))
+
+    problems = _sanity_problems(len(stubs), len(details), details, failed)
+    if problems:
+        section["error"] = (
+            "Workflow pull failed its sanity check; Area 5 must be scored "
+            "UNKNOWN, not green: " + "; ".join(problems)
+        )
+        section["sanity_problems"] = problems
+        return section
+
     section["available"] = True
-    section["total"] = len(workflows)
+    section["sanity_check"] = "passed"
+    section["failed_reads"] = failed
 
-    on = [w for w in workflows if w.get("enabled")]
-    off = [w for w in workflows if not w.get("enabled")]
-    stale_on, old_logic, unnamed = [], [], []
-    by_type = {}
-    inventory = []
-    # Hygiene-critical property targets we care about
-    HYGIENE_PROPS = ("lifecyclestage", "hs_lead_status", "hubspot_owner_id")
-    props_written_by = {}  # property name -> [workflow names] (redundancy/conflict detection)
-
+    written, inventory = set(), []
     vague_tokens = ("workflow ", "test", "copy of", "untitled", "new workflow", "temp")
-    for w in workflows:
-        wtype = w.get("type", "UNKNOWN")
-        by_type[wtype] = by_type.get(wtype, 0) + 1
+    unnamed = []
+
+    for w in details:
         name = (w.get("name") or "").strip()
         low = name.lower()
         if not name or any(t in low for t in vague_tokens):
             unnamed.append(name or f"(id {w.get('id')})")
-        updated_age = _age_days(w.get("updatedAt") or w.get("migrationTimestamp"))
-        if w.get("enabled") and updated_age is not None and updated_age > OLD_LOGIC_DAYS:
-            old_logic.append({"name": name, "days_since_modified": updated_age})
 
-        # Pull the full definition to see actions, enrollment, re-enrollment
-        action_types = {}
-        props_set = []
-        detail, s2, _ = client.get(f"automation/v3/workflows/{w.get('id')}")
-        re_enroll = None
-        only_manual = None
-        if s2 == 200 and isinstance(detail, dict):
-            last_activity = _age_days(detail.get("updatedAt"))
-            if w.get("enabled") and last_activity is not None and last_activity > STALE_DAYS:
-                stale_on.append({"name": name, "days_since_activity": last_activity})
-            only_manual = detail.get("onlyEnrollsManually")
-            re_enroll = bool(detail.get("reEnrollmentTriggerSets"))
-            for a in detail.get("actions", []) or []:
-                at = a.get("type", "UNKNOWN")
-                action_types[at] = action_types.get(at, 0) + 1
-                pn = a.get("propertyName")
-                if pn:
-                    props_set.append(pn)
-                    props_written_by.setdefault(pn, []).append(name)
+        action_types, props_set = {}, []
+        for a in w.get("actions") or []:
+            at = a.get("actionTypeId", "UNKNOWN")
+            action_types[at] = action_types.get(at, 0) + 1
+            if at != SET_PROPERTY_ACTION:
+                continue
+            fields = a.get("fields", {}) or {}
+            prop = fields.get("property_name") or fields.get("propertyName")
+            if prop:
+                props_set.append(prop)
+                written.add(prop)
 
+        enrol = w.get("enrollmentCriteria") or {}
         inventory.append({
             "id": w.get("id"),
             "name": name,
-            "enabled": w.get("enabled"),
+            "enabled": bool(w.get("_isEnabled")),
+            "object_type": OBJECT_LABELS.get(w.get("objectTypeId"), w.get("objectTypeId")),
+            "flow_type": w.get("type"),
             "action_types": action_types,
             "properties_set": sorted(set(props_set)),
-            "sets_hygiene_props": sorted(set(p for p in props_set if p in HYGIENE_PROPS)),
-            "re_enrollment": re_enroll,
-            "only_enrolls_manually": only_manual,
-            "days_since_modified": updated_age,
+            "sets_hygiene_props": sorted({p for p in props_set if p in HYGIENE_PROPS}),
+            "re_enrollment": bool(enrol.get("shouldReEnroll")),
+            "has_enrollment_criteria": bool(
+                enrol.get("listFilterBranch") or enrol.get("eventFilterBranches")
+            ),
+            # last EDIT, not last run. HubSpot exposes no last-run field.
+            "days_since_modified": _age_days(w.get("updatedAt")),
         })
 
-    # Which hygiene-critical automations exist anywhere?
-    hygiene_coverage = {
-        p: sorted(set(wf["name"] for wf in inventory if p in wf["properties_set"]))
-        for p in HYGIENE_PROPS
-    }
-    # Properties written by more than one workflow = potential race/overwrite
-    conflicts = {p: v for p, v in props_written_by.items() if len(set(v)) > 1}
-
+    on = [w for w in inventory if w["enabled"]]
     section["counts"] = {
+        "total": len(inventory),
         "on": len(on),
-        "off": len(off),
-        "stale_on_90d": len(stale_on),
-        "old_logic_365d": len(old_logic),
+        "off": len(inventory) - len(on),
         "unnamed_or_vague": len(unnamed),
+        "no_enrollment_criteria": sum(1 for w in inventory if not w["has_enrollment_criteria"]),
     }
-    section["by_type"] = by_type
+    section["by_object_type"] = {
+        lbl: sum(1 for w in inventory if w["object_type"] == lbl)
+        for lbl in {w["object_type"] for w in inventory}
+    }
+    section["properties_written_by_workflows"] = sorted(written)
+    section["hygiene_coverage"] = {
+        prop: sorted({w["name"] for w in inventory if prop in w["properties_set"]})
+        for prop in HYGIENE_PROPS
+    }
+    section["governance_gaps"] = [
+        label for prop, label in HYGIENE_PROPS.items() if prop not in written
+    ]
     section["inventory"] = inventory
-    section["hygiene_coverage"] = hygiene_coverage
-    section["property_write_conflicts"] = conflicts
-    section["stale_on"] = stale_on[:50]
-    section["old_logic"] = old_logic[:50]
     section["unnamed"] = unnamed[:50]
     section["note"] = (
-        "Per-workflow error state is not exposed by the public v3 API; confirm "
-        "error banners in the HubSpot UI (Automation > Workflows > 'Needs review'). "
-        "hygiene_coverage shows which workflows (if any) set lifecycle stage, lead "
-        "status, or owner — empty lists mean that automation is absent."
+        "Per-workflow error state is not exposed by the public API; confirm "
+        "error banners in the HubSpot UI (Automation > Workflows > 'Needs "
+        "review'). days_since_modified is the last EDIT, never the last run — "
+        "no HubSpot API returns a workflow's last-run time, so do not infer "
+        "that a workflow is dormant from it."
     )
     return section
 
@@ -243,7 +363,30 @@ def audit_sender_auth(client):
     ]
     email_domains = [d for d in domains if d.get("isUsedForEmail")]
     section["email_sending_domain_count"] = len(email_domains)
-    section["unverified_dns"] = [d.get("domain") for d in domains if not d.get("isDnsCorrect")]
+
+    # isDnsCorrect is False only when DNS genuinely fails. When HubSpot omits
+    # the field entirely, treating absent as failing flags every domain on
+    # every portal, so absent is reported separately rather than as a failure.
+    section["unverified_dns"] = [
+        d.get("domain") for d in domains if d.get("isDnsCorrect") is False
+    ]
+    section["dns_state_not_reported"] = [
+        d.get("domain") for d in domains if d.get("isDnsCorrect") is None
+    ]
+
+    # HubSpot-issued subdomains are not an authenticated company sending
+    # domain. A portal with no custom domain has no DKIM/SPF of its own,
+    # which the DNS flags above will never surface.
+    HUBSPOT_SUFFIXES = (
+        ".hs-sites.com", ".hs-sites-eu1.com", ".hubspotpagebuilder.com",
+        ".hubspotpagebuilder.eu", ".hs-sites-na2.com", ".hubspotpagebuilder.net",
+    )
+    custom = [
+        d.get("domain") for d in domains
+        if d.get("domain") and not any(str(d["domain"]).endswith(s) for s in HUBSPOT_SUFFIXES)
+    ]
+    section["custom_domains"] = custom
+    section["has_custom_sending_domain"] = bool(custom)
     return section
 
 
@@ -358,10 +501,11 @@ def main():
                 state = "ON " if wf["enabled"] else "OFF"
                 acts = ",".join(f"{a}x{n}" for a, n in wf["action_types"].items()) or "(none)"
                 hyg = ",".join(wf["sets_hygiene_props"]) or "-"
-                print(f"    [{state}] {wf['name']}")
+                print(f"    [{state}] {wf['name']}  ({wf['object_type']})")
                 print(f"           actions: {acts}")
                 print(f"           sets: {','.join(wf['properties_set']) or '(no property writes)'}")
-                print(f"           hygiene-props set: {hyg} | re-enroll: {wf['re_enrollment']}")
+                print(f"           hygiene-props set: {hyg} | re-enroll: {wf['re_enrollment']}"
+                      f" | enrollment criteria: {wf['has_enrollment_criteria']}")
         print()
     print(f"Full JSON written to: {json_path}")
 
