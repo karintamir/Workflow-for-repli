@@ -12,3 +12,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Client audit deliverables — contain client CRM data and employee emails.
+# Deliver via Drive/email, not git history.
+out/
