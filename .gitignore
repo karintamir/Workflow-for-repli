@@ -1,0 +1,14 @@
+# Secrets — never commit real credentials
+.env
+.env.*
+!.env.example
+
+# hs_audit.py output
+audit_out/
+*_hs_audit.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
