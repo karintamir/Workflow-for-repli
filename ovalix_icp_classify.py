@@ -643,18 +643,20 @@ def main():
                     help="apply changes to the CRM (default is dry run)")
     ap.add_argument("--rollback", metavar="FILE",
                     help="restore the three properties from a before-file")
-    ap.add_argument("--include-manager", action="store_true",
-                    help="OPEN DECISION: add 'manager' to the Tier 3 rule, "
-                         "moving ~150 security managers out of out_of_scope")
+    ap.add_argument("--exclude-manager", action="store_true",
+                    help="revert the resolved manager decision: drop 'manager' "
+                         "from the Tier 3 rule, sending security managers to "
+                         "residue instead of tier_3")
     ap.add_argument("--no-company", action="store_true",
                     help="skip company enrichment; solution-architect and "
                          "vendor-seller cases then go to residue")
     args = ap.parse_args()
 
-    token = os.environ.get("HUBSPOT_PRIVATE_APP_TOKEN")
+    token = (os.environ.get("HUBSPOT_TOKEN")
+             or os.environ.get("HUBSPOT_PRIVATE_APP_TOKEN"))
     if not token:
-        sys.exit("Set HUBSPOT_PRIVATE_APP_TOKEN (portal %s, contacts read+write)."
-                 % PORTAL_ID)
+        sys.exit("Set HUBSPOT_TOKEN or HUBSPOT_PRIVATE_APP_TOKEN "
+                 "(portal %s, contacts read+write)." % PORTAL_ID)
 
     client = HubSpot(token, dry_run=not args.write)
 
@@ -672,17 +674,23 @@ def main():
     companies = {}
     if not args.no_company:
         print("\nFetching company context (Step 3 and Step 4 need it)...")
-        companies = client.company_context([c["id"] for c in contacts])
+        candidates = [c["id"] for c in contacts
+                      if (c["properties"].get(TIER_PROP) or None) in (None, "tier_1")]
+        print("  %d records need company context (unclassified + tier_1 cleanup)"
+              % len(candidates))
+        companies = client.company_context(candidates)
         print("  company context for %d of %d contacts" % (len(companies), len(contacts)))
     else:
         print("\n  --no-company: seller detection is title-only; solution")
         print("  architects and vendor-ambiguous titles go to residue.")
 
-    if args.include_manager:
-        print("\n  OPEN DECISION: 'manager' INCLUDED — security managers -> tier_3")
+    include_manager = not args.exclude_manager
+    if include_manager:
+        print("\n  RESOLVED: security managers grade tier_3 — they influence and")
+        print("  evaluate without owning budget, which is what tier_3 is for.")
     else:
-        print("\n  OPEN DECISION: 'manager' excluded (spec default) — ~150 security")
-        print("  managers fall through and are marked out_of_scope.")
+        print("\n  --exclude-manager: reverting the resolved decision; security")
+        print("  managers go to residue rather than tier_3.")
 
     rows, residue, before, updates = [], [], [], []
 
@@ -693,7 +701,7 @@ def main():
         current = props.get(TIER_PROP) or None
         company = companies.get(cid) or {}
 
-        out = process(title, current, company, args.include_manager)
+        out = process(title, current, company, include_manager)
         if out.tier is None and out.residue is None:
             continue
 
@@ -740,6 +748,7 @@ def main():
     write_csv(RESIDUE_CSV,
               ["hs_object_id", "email", "jobtitle", "company_domain",
                "current_tier", "residue_reason"], residue)
+    write_csv(BEFORE_CSV, ["hs_object_id"] + WRITTEN_PROPS, before)
 
     validate(rows, residue)
 
@@ -751,7 +760,6 @@ def main():
     if not baseline_ok:
         sys.exit("\nRefusing to write: baseline count does not match the spec.")
 
-    write_csv(BEFORE_CSV, ["hs_object_id"] + WRITTEN_PROPS, before)
     print("\nWriting %d records to portal %s..." % (len(updates), PORTAL_ID))
     client.batch_update(updates)
     print("Done. Rollback with: --write --rollback %s" % BEFORE_CSV)
