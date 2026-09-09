@@ -75,6 +75,10 @@ EXPECTED_L3_SEGMENT = 561
 DRYRUN_CSV = "ovalix_icp_dryrun.csv"
 BEFORE_CSV = "ovalix_icp_before.csv"
 RESIDUE_CSV = "ovalix_icp_residue.csv"
+GRADED_CSV = "ovalix_icp_residue_graded.csv"
+GRADED_FIXED_CSV = "ovalix_icp_residue_graded_fixed.csv"
+
+ALLOWED_TIERS = {"tier_1", "tier_2", "tier_3", "out_of_scope", "unknown"}
 
 # ==========================================================================
 # Step 1 — Normalisation
@@ -345,6 +349,20 @@ SELLER_COMPANY = ["reseller", "mssp", "systems integrator", "consultancy",
                   "consulting", "distributor"]
 
 
+def flag_rests_on_evidence(t, company):
+    """Step 4: "Default to No. Uncertainty is not evidence."
+
+    A seller title is evidence on its own -- signal 1 needs no company data,
+    and a vendor-side title like "Field CISO" names the vendor relationship
+    in the title itself. Signals 2 and 3 rest on company context, so if there
+    is no company context at all the flag rests on nothing and is dropped.
+    """
+    if has_word(t, SELLER_TITLE) or has_word(t, SELLER_VENDOR_TITLE):
+        return True
+    return bool(company and (company.get("domain") or company.get("name")
+                             or company.get("industry")))
+
+
 def seller_flag(t, company):
     """Step 4. Default to No. Uncertainty is not evidence."""
     if has_word(t, SELLER_TITLE):
@@ -519,7 +537,9 @@ class HubSpot:
             for row in res.get("results", []):
                 targets = row.get("to") or []
                 if targets:
-                    assoc[row["from"]["id"]] = targets[0]["toObjectId"]
+                    # toObjectId is an int; the companies batch keys by string.
+                    # Mismatching these silently yields {} for every contact.
+                    assoc[row["from"]["id"]] = str(targets[0]["toObjectId"])
             time.sleep(0.12)
 
         company_ids = sorted(set(assoc.values()))
@@ -529,7 +549,8 @@ class HubSpot:
             chunk = company_ids[i:i + 100]
             res = self._request(
                 "POST", "/crm/v3/objects/companies/batch/read",
-                {"properties": COMPANY_PROPS, "inputs": [{"id": c} for c in chunk]})
+                {"properties": COMPANY_PROPS,
+                 "inputs": [{"id": str(c)} for c in chunk]})
             for row in res.get("results", []):
                 companies[row["id"]] = row.get("properties", {})
             time.sleep(0.12)
@@ -620,6 +641,60 @@ def write_csv(path, fieldnames, rows):
     print("  wrote %s (%d rows)" % (path, len(rows)))
 
 
+def load_graded(path, residue_ids):
+    """Load hand-graded residue records and validate them hard.
+
+    These bypass every rule in this file, so they get stricter checking than
+    anything the rules produce: a typo here writes a bad tier with no rule to
+    blame. Returns {id: (tier, flag, reason)}.
+    """
+    graded, problems = {}, []
+    with open(path, newline="", encoding="utf-8") as fh:
+        for i, row in enumerate(csv.DictReader(fh), start=2):
+            cid = (row.get("hs_object_id") or "").strip()
+            tier = (row.get(TIER_PROP) or "").strip().lower()
+            flag = (row.get(FLAG_PROP) or "").strip().lower()
+            reason = (row.get(REASON_PROP) or "").strip()
+
+            if not cid:
+                problems.append("line %d: no hs_object_id" % i)
+                continue
+            if cid in graded:
+                problems.append("line %d: duplicate hs_object_id %s" % (i, cid))
+                continue
+            if cid not in residue_ids:
+                problems.append("line %d: id %s is not in the residue set -- "
+                                "grading a record the rules already decided" % (i, cid))
+                continue
+            if tier not in ALLOWED_TIERS:
+                problems.append("line %d: tier %r not one of %s"
+                                % (i, tier, sorted(ALLOWED_TIERS)))
+                continue
+            if flag not in ("true", "false"):
+                problems.append("line %d: seller flag %r is not true/false" % (i, flag))
+                continue
+            if not reason:
+                problems.append("line %d: empty reason" % i)
+                continue
+            if len(reason.split()) > 15:
+                problems.append("line %d: reason is %d words, limit is 15"
+                                % (i, len(reason.split())))
+                continue
+            graded[cid] = (tier, flag == "true", reason)
+
+    if problems:
+        sys.stderr.write("\nGraded file rejected -- %d problem(s):\n" % len(problems))
+        for p in problems[:20]:
+            sys.stderr.write("  %s\n" % p)
+        sys.exit("Refusing to write. Fix %s and re-run." % path)
+
+    ungraded = residue_ids - set(graded)
+    if ungraded:
+        print("  NOTE: %d residue records are not in the graded file and will "
+              "stay unwritten." % len(ungraded))
+    return graded
+
+
 def rollback(client, path):
     inputs = []
     with open(path, newline="", encoding="utf-8") as fh:
@@ -693,6 +768,7 @@ def main():
         print("  managers go to residue rather than tier_3.")
 
     rows, residue, before, updates = [], [], [], []
+    originals, dropped_flags = {}, 0
 
     for c in contacts:
         props = c["properties"]
@@ -704,6 +780,13 @@ def main():
         out = process(title, current, company, include_manager)
         if out.tier is None and out.residue is None:
             continue
+
+        # Step 4 guard, applied before anything is recorded.
+        if out.flag and not flag_rests_on_evidence(normalise(title), company):
+            out.flag = False
+            dropped_flags += 1
+
+        originals[cid] = props
 
         rows.append({
             "hs_object_id": cid,
@@ -748,6 +831,48 @@ def main():
     write_csv(RESIDUE_CSV,
               ["hs_object_id", "email", "jobtitle", "company_domain",
                "current_tier", "residue_reason"], residue)
+
+    residue_ids = {r["hs_object_id"] for r in residue}
+    graded = {}
+    # Prefer a repaired grading file when one exists. Spreadsheet round-trips
+    # turn 12-digit contact ids into scientific notation ("1.10638E+11"),
+    # which silently truncates them to 6 significant figures.
+    graded_path = (GRADED_FIXED_CSV if os.path.exists(GRADED_FIXED_CSV)
+                   else GRADED_CSV)
+    if os.path.exists(graded_path):
+        print("\nMerging hand-graded residue from %s" % graded_path)
+        graded = load_graded(graded_path, residue_ids)
+        for cid, (tier, flag, reason) in graded.items():
+            props = originals.get(cid, {})
+            before.append({
+                "hs_object_id": cid,
+                TIER_PROP: props.get(TIER_PROP) or "",
+                FLAG_PROP: props.get(FLAG_PROP) or "",
+                REASON_PROP: props.get(REASON_PROP) or "",
+            })
+            updates.append({"id": cid, "properties": {
+                TIER_PROP: tier,
+                FLAG_PROP: "true" if flag else "false",
+                REASON_PROP: reason,
+            }})
+        print("  %d graded records merged into the write set" % len(graded))
+    else:
+        print("\n  No %s found -- the %d residue records stay unwritten."
+              % (GRADED_CSV, len(residue)))
+
+    # A record must never be written twice. The rule set and the graded file
+    # are disjoint by construction (graded ids must be residue ids, and
+    # residue ids are excluded from updates), but assert it rather than trust it.
+    ids = [u["id"] for u in updates]
+    if len(set(ids)) != len(ids):
+        dupes = [i for i, n in Counter(ids).items() if n > 1]
+        sys.exit("ABORT: %d id(s) appear twice in the write set: %s"
+                 % (len(dupes), dupes[:10]))
+
+    if dropped_flags:
+        print("\n  Step 4 guard: dropped %d seller flag(s) resting on no "
+              "evidence." % dropped_flags)
+
     write_csv(BEFORE_CSV, ["hs_object_id"] + WRITTEN_PROPS, before)
 
     validate(rows, residue)
