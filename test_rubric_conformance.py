@@ -118,7 +118,15 @@ SELLER_CASES = [
     ("Channel Account Manager", True, INHOUSE, "S4-title"),
     ("Cybersecurity Solution Architect", True, VENDOR, "S4-vendor-sa"),
     ("Director of Information Security", False, INHOUSE, "S4-default-no"),
-    ("CISO", True, VENDOR, "S4-tier1-at-vendor"),
+    # CONFIRMED DECISION: narrow reading. Step 4's "a Tier 1 title at a
+    # competing vendor is still Tier 1 with seller_flag: Yes" is NOT fired on
+    # company industry alone -- doing so would flag every CISO at any security
+    # or software company and remove real buyers from marketing. The flag
+    # fires on vendor-side TITLES (field CISO, vCISO, fractional, advisor)
+    # per spec C2, and on explicit reseller/MSSP/SI/consultancy companies.
+    ("CISO", False, VENDOR, "S4-tier1-at-vendor-narrow"),
+    ("Field CISO", True, VENDOR, "S4-vendor-side-title"),
+    ("Virtual CISO (vCISO)", True, VENDOR, "S4-vendor-side-title"),
 ]
 
 RESIDUE_CASES = ["Director", "Manager", "Consultant", "Analyst", "IT"]

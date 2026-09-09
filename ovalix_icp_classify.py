@@ -147,8 +147,16 @@ def hit_word(t, terms):
 # ==========================================================================
 
 # 'of'/'the' are stripped in normalisation, so "head of" is written "head".
-SECURITY = ["security", "cyber", "infosec", "privacy",
-            "data protection", "grc", "governance", "risk"]
+# Tier 1's remit per the rubric: "security, cyber, information security,
+# privacy, data, or AI governance". Note what is ABSENT -- bare 'risk' and
+# bare 'governance'. Those appear only in Tier 2's remit, so promoting on them
+# grades an IT VP with a vendor-risk remit as executive security leadership.
+TIER1_REMIT = ["security", "cyber", "infosec", "privacy",
+               "data protection", "ai governance"]
+
+# Tier 2's remit adds risk, governance and GRC. Also used by the architecture
+# and senior-contributor rules, which the rubric places in security broadly.
+SECURITY = TIER1_REMIT + ["grc", "governance", "risk"]
 
 ARCHITECTURE = ["architect", "architecture"]
 EXEC = ["chief", "cso", "evp", "svp", "executive vice president",
@@ -184,7 +192,7 @@ def assign_tier(t, include_manager=False):
     if has(t, SECURITY) and has(t, ["deputy"]):
         return ("tier_2", "Deputy-level security function owner.", "S2-deputy")
 
-    if has(t, SECURITY) and has(t, EXEC):
+    if has(t, TIER1_REMIT) and has(t, EXEC):
         return ("tier_1", "Executive security leadership.", "S2-exec")
 
     if has(t, DATA_AI_EXEC):
