@@ -369,13 +369,13 @@ def seller_flag(t, company):
         return True
     if has_word(t, SELLER_VENDOR_TITLE) and looks_like_vendor(company) is True:
         return True
-    if company:
-        blob = " ".join(filter(None, [
-            (company.get("name") or "").lower(),
-            (company.get("industry") or "").lower().replace("_", " "),
-        ]))
-        if any(h in blob for h in SELLER_COMPANY):
-            return True
+    # Signal 3 (company is a reseller/MSSP/SI/consultancy) is deliberately NOT
+    # implemented. It would have to read HubSpot's industry field, which is too
+    # coarse to carry it -- Equifax, TransUnion and Upwork are all tagged
+    # MANAGEMENT_CONSULTING in this portal. More to the point, Ops: Contact Type
+    # already answers this from a maintained 103-domain channel list, and
+    # channel partners are never graded at all, so re-deriving it from an
+    # industry tag is both unreliable and redundant.
     return False
 
 
@@ -875,6 +875,41 @@ def main():
         dupes = [i for i, n in Counter(ids).items() if n > 1]
         sys.exit("ABORT: %d id(s) appear twice in the write set: %s"
                  % (len(dupes), dupes[:10]))
+
+    # A record cannot be an in-scope buyer and a seller at once. Anything that
+    # is both is a rule defect, and defects do not get written.
+    by_id = {r["hs_object_id"]: r for r in rows}
+    both = [u for u in updates
+            if u["properties"][TIER_PROP] in ("tier_1", "tier_2")
+            and u["properties"][FLAG_PROP] == "true"]
+
+    # C2 is the one documented exception, required by both source documents:
+    # spec C2 ("a genuine CISO title at a vendor stays Tier 1 ... set
+    # icp_seller_flag = true") and rubric Step 4 ("The seller flag is
+    # independent of the tier. A genuine Tier 1 title at a competing vendor is
+    # still Tier 1 with icp_seller_flag: Yes"). It is exempted, never silently
+    # -- every exempted record is printed on every run.
+    exempt = [u for u in both if (by_id.get(u["id"], {}).get("rule_fired") == "C2")]
+    contradictions = [u for u in both if u not in exempt]
+
+    if exempt:
+        print("\n  C2 exemption — %d vendor-side CISO(s) keep tier_1 AND the"
+              % len(exempt))
+        print("  seller flag. Required by spec C2 and rubric Step 4:")
+        for u in exempt:
+            print("     %-14s %s" % (u["id"],
+                  (by_id.get(u["id"], {}).get("jobtitle") or "")[:56]))
+
+    if contradictions:
+        sys.stderr.write("\nCONSISTENCY FAILURE: %d record(s) are tier_1/tier_2 "
+                         "AND seller_flag true.\n" % len(contradictions))
+        for u in contradictions[:20]:
+            r = by_id.get(u["id"], {})
+            sys.stderr.write("  %-14s %-46s %s [%s]\n"
+                             % (u["id"], (r.get("jobtitle") or "")[:46],
+                                u["properties"][TIER_PROP], r.get("rule_fired")))
+        sys.exit("Refusing to write: a record cannot be both an in-scope buyer "
+                 "and a seller.")
 
     if dropped_flags:
         print("\n  Step 4 guard: dropped %d seller flag(s) resting on no "
