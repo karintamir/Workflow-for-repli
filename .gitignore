@@ -1,0 +1,6 @@
+# Dry-run and rollback output. These carry contact emails and job titles for
+# real Ovalix records -- client PII. They are deliverables for review, not
+# repository content, and must not be committed.
+ovalix_icp_dryrun.csv
+ovalix_icp_residue.csv
+ovalix_icp_before.csv
