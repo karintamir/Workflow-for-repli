@@ -456,6 +456,13 @@ def process(title_raw, current_tier, company, include_manager=False):
     reason = placed[1] if placed else "Role outside the security buying committee."
     rule = placed[2] if placed else "S2-catchall"
 
+    # A bare architect title Step 2 could not place has no security term in it
+    # at all. It is out of scope for that reason, not because it is vendor-side
+    # -- the employer may be an ordinary enterprise. Say so accurately.
+    if not placed and has(t, ARCHITECTURE):
+        reason = "Architect role outside security remit."
+        rule = "S2-arch-catchall"
+
     excl = apply_exclusions(t, tier, company)
     if excl:
         if excl[0] == "RESIDUE":
